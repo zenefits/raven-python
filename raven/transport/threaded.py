@@ -16,7 +16,7 @@ from time import sleep, time
 
 from raven.transport.base import AsyncTransport
 from raven.transport.http import HTTPTransport
-from raven.utils.compat import Queue
+from raven.utils.compat import Queue, check_threads
 
 DEFAULT_TIMEOUT = 10
 
@@ -27,6 +27,7 @@ class AsyncWorker(object):
     _terminator = object()
 
     def __init__(self, shutdown_timeout=DEFAULT_TIMEOUT):
+        check_threads()
         self._queue = Queue(-1)
         self._lock = threading.Lock()
         self._thread = None
@@ -116,7 +117,7 @@ class AsyncWorker(object):
         self._lock.acquire()
         try:
             if not self.is_alive():
-                self._thread = threading.Thread(target=self._target)
+                self._thread = threading.Thread(target=self._target, name="raven.AsyncWorker")
                 self._thread.setDaemon(True)
                 self._thread.start()
                 self._thread_for_pid = os.getpid()

@@ -5,13 +5,14 @@ import inspect
 import mock
 import raven
 import time
+import six
+import os
 
 from raven.base import Client, ClientState
 from raven.exceptions import RateLimited
 from raven.transport import AsyncTransport
 from raven.transport.http import HTTPTransport
 from raven.utils.stacks import iter_stack_frames
-from raven.utils import six
 from raven.utils.testutils import TestCase
 
 
@@ -93,6 +94,15 @@ class ClientTest(TestCase):
 
         assert base.Raven is client
         assert client is not client2
+
+    def test_client_picks_up_env_dsn(self):
+        DSN = 'sync+http://public:secret@example.com/1'
+        PUBLIC_DSN = '//public@example.com/1'
+        with mock.patch.dict(os.environ, {'SENTRY_DSN': DSN}):
+            client = Client()
+            assert client.remote.get_public_dsn() == PUBLIC_DSN
+            client = Client('')
+            assert client.remote.get_public_dsn() == PUBLIC_DSN
 
     @mock.patch('raven.transport.http.HTTPTransport.send')
     @mock.patch('raven.base.ClientState.should_try')
@@ -282,7 +292,7 @@ class ClientTest(TestCase):
         event = self.client.events.pop(0)
         self.assertEquals(event['message'], 'ValueError: foo')
         self.assertTrue('exception' in event)
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'ValueError')
         self.assertEquals(exc['value'], 'foo')
         self.assertEquals(exc['module'], ValueError.__module__)  # this differs in some Python versions
@@ -295,6 +305,24 @@ class ClientTest(TestCase):
         self.assertEquals(frame['module'], __name__)
         self.assertEquals(frame['function'], 'test_exception_event')
         self.assertTrue('timestamp' in event)
+
+    def test_exception_event_true_exc_info(self):
+        try:
+            raise ValueError('foo')
+        except ValueError:
+            self.client.captureException(exc_info=True)
+
+        self.assertEquals(len(self.client.events), 1)
+        event = self.client.events.pop(0)
+        self.assertEquals(event['message'], 'ValueError: foo')
+        self.assertTrue('exception' in event)
+        exc = event['exception']['values'][-1]
+        stacktrace = exc['stacktrace']
+        self.assertEquals(len(stacktrace['frames']), 1)
+        frame = stacktrace['frames'][0]
+        self.assertEquals(frame['abs_path'], __file__.replace('.pyc', '.py'))
+        self.assertEquals(frame['filename'], 'tests/base/tests.py')
+        self.assertEquals(frame['module'], __name__)
 
     def test_decorator_preserves_function(self):
         @self.client.capture_exceptions
@@ -319,7 +347,7 @@ class ClientTest(TestCase):
         self.assertEquals(len(self.client.events), 1)
         event = self.client.events.pop(0)
         self.assertEquals(event['message'], 'DecoratorTestException')
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'DecoratorTestException')
         self.assertEquals(exc['module'], self.DecoratorTestException.__module__)
         stacktrace = exc['stacktrace']
@@ -354,7 +382,7 @@ class ClientTest(TestCase):
         self.assertEquals(len(self.client.events), 1)
         event = self.client.events.pop(0)
         self.assertEquals(event['message'], 'DecoratorTestException')
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'DecoratorTestException')
         self.assertEquals(exc['module'], self.DecoratorTestException.__module__)
         stacktrace = exc['stacktrace']
@@ -535,7 +563,7 @@ class ClientTest(TestCase):
         })
 
         event = client.events.pop(0)
-        frames = event['exception']['values'][0]['stacktrace']['frames']
+        frames = event['exception']['values'][-1]['stacktrace']['frames']
         assert frames[0]['in_app']
         assert not frames[1]['in_app']
         assert not frames[2]['in_app']

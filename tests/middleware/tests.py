@@ -3,6 +3,7 @@ from __future__ import with_statement
 import logging
 import webob
 from exam import fixture
+from six import Iterator
 from raven.utils.testutils import TestCase
 
 from raven.base import Client
@@ -21,11 +22,14 @@ class TempStoreClient(Client):
         self.events.append(kwargs)
 
 
-class ErroringIterable(object):
+class ErroringIterable(Iterator):
     def __init__(self):
         self.closed = False
 
     def __iter__(self):
+        return self
+
+    def __next__(self):
         raise ValueError('hello world')
 
     def close(self):
@@ -37,7 +41,25 @@ class ExitingIterable(ErroringIterable):
         self._exc_func = exc_func
 
     def __iter__(self):
+        return self
+
+    def __next__(self):
         raise self._exc_func()
+
+
+class SimpleIteratable(Iterator):
+    def __init__(self):
+        self.closed = False
+        self._iter = iter(['a'])
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._iter)
+
+    def close(self):
+        self.closed = True
 
 
 class ExampleApp(object):
@@ -67,14 +89,11 @@ class MiddlewareTestCase(TestCase):
         with self.assertRaises(ValueError):
             response = list(response)
 
-        # TODO: this should be a separate test
-        self.assertTrue(iterable.closed, True)
-
         self.assertEquals(len(self.client.events), 1)
         event = self.client.events.pop(0)
 
         assert 'exception' in event
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'ValueError')
         self.assertEquals(exc['value'], 'hello world')
         self.assertEquals(event['level'], logging.ERROR)
@@ -105,9 +124,6 @@ class MiddlewareTestCase(TestCase):
         with self.assertRaises(SystemExit):
             response = list(response)
 
-        # TODO: this should be a separate test
-        self.assertTrue(iterable.closed, True)
-
         self.assertEquals(len(self.client.events), 0)
 
     def test_systemexit_is_captured(self):
@@ -120,14 +136,11 @@ class MiddlewareTestCase(TestCase):
         with self.assertRaises(SystemExit):
             response = list(response)
 
-        # TODO: this should be a separate test
-        self.assertTrue(iterable.closed, True)
-
         self.assertEquals(len(self.client.events), 1)
         event = self.client.events.pop(0)
 
         assert 'exception' in event
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'SystemExit')
         self.assertEquals(exc['value'], '1')
         self.assertEquals(event['level'], logging.ERROR)
@@ -143,14 +156,21 @@ class MiddlewareTestCase(TestCase):
         with self.assertRaises(KeyboardInterrupt):
             response = list(response)
 
-        # TODO: this should be a separate test
-        self.assertTrue(iterable.closed, True)
-
         self.assertEquals(len(self.client.events), 1)
         event = self.client.events.pop(0)
 
         assert 'exception' in event
-        exc = event['exception']['values'][0]
+        exc = event['exception']['values'][-1]
         self.assertEquals(exc['type'], 'KeyboardInterrupt')
         self.assertEquals(exc['value'], '')
         self.assertEquals(event['level'], logging.ERROR)
+
+    def test_close(self):
+        iterable = SimpleIteratable()
+        app = ExampleApp(iterable)
+        middleware = Sentry(app, client=self.client)
+
+        response = middleware(self.request.environ, lambda *args: None)
+        list(response)  # exhaust iterator
+        response.close()
+        self.assertTrue(iterable.closed, True)

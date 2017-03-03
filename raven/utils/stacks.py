@@ -5,22 +5,22 @@ raven.utils.stacks
 :copyright: (c) 2010-2012 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 
 import inspect
 import linecache
 import re
 import sys
-import warnings
 
 from raven.utils.serializer import transform
-from raven.utils import six
+from raven._compat import iteritems
 
 
 _coding_re = re.compile(r'coding[:=]\s*([-\w.]+)')
 
 
-def get_lines_from_file(filename, lineno, context_lines, loader=None, module_name=None):
+def get_lines_from_file(filename, lineno, context_lines,
+                        loader=None, module_name=None):
     """
     Returns context_lines before and after lineno from file.
     Returns (pre_context_lineno, pre_context, context_line, post_context).
@@ -29,7 +29,7 @@ def get_lines_from_file(filename, lineno, context_lines, loader=None, module_nam
     if loader is not None and hasattr(loader, "get_source"):
         try:
             source = loader.get_source(module_name)
-        except ImportError:
+        except (ImportError, IOError):
             # Traceback (most recent call last):
             #   File "/Users/dcramer/Development/django-sentry/sentry/client/handlers.py", line 31, in emit
             #     get_client().create_from_record(record, request=request)
@@ -61,49 +61,24 @@ def get_lines_from_file(filename, lineno, context_lines, loader=None, module_nam
     upper_bound = min(lineno + 1 + context_lines, len(source))
 
     try:
-        pre_context = [line.strip('\r\n') for line in source[lower_bound:lineno]]
+        pre_context = [
+            line.strip('\r\n')
+            for line in source[lower_bound:lineno]
+        ]
         context_line = source[lineno].strip('\r\n')
-        post_context = [line.strip('\r\n') for line in source[(lineno + 1):upper_bound]]
+        post_context = [
+            line.strip('\r\n')
+            for line in source[(lineno + 1):upper_bound]
+        ]
     except IndexError:
         # the file may have changed since it was loaded into memory
         return None, None, None
 
-    return pre_context, context_line, post_context
-
-
-def label_from_frame(frame):
-    module = frame.get('module') or '?'
-    function = frame.get('function') or '?'
-    if module == function == '?':
-        return ''
-    return '%s in %s' % (module, function)
-
-
-def get_culprit(frames, *args, **kwargs):
-    # We iterate through each frame looking for a deterministic culprit
-    # When one is found, we mark it as last "best guess" (best_guess) and then
-    # check it against ``exclude_paths``. If it isn't listed, then we
-    # use this option. If nothing is found, we use the "best guess".
-    if args or kwargs:
-        warnings.warn('get_culprit no longer does application detection')
-
-    best_guess = None
-    culprit = None
-    for frame in reversed(frames):
-        culprit = label_from_frame(frame)
-        if not culprit:
-            culprit = None
-            continue
-
-        if frame.get('in_app'):
-            return culprit
-        elif not best_guess:
-            best_guess = culprit
-        elif best_guess:
-            break
-
-    # Return either the best guess or the last frames call
-    return best_guess or culprit
+    return (
+        slim_string(pre_context),
+        slim_string(context_line),
+        slim_string(post_context)
+    )
 
 
 def _getitem_from_frame(f_locals, key, default=None):
@@ -138,7 +113,9 @@ def iter_traceback_frames(tb):
     frames that do not contain the ``__traceback_hide__``
     local variable.
     """
-    while tb:
+    # Some versions of celery have hacked traceback objects that might
+    # miss tb_frame.
+    while tb and hasattr(tb, 'tb_frame'):
         # support for __traceback_hide__ which is used by a few libraries
         # to hide internal frames.
         f_locals = getattr(tb.tb_frame, 'f_locals', {})
@@ -178,7 +155,7 @@ def get_frame_locals(frame, transformer=transform, max_var_size=4096):
 
     f_vars = {}
     f_size = 0
-    for k, v in six.iteritems(f_locals):
+    for k, v in iteritems(f_locals):
         v = transformer(v)
         v_size = len(repr(v))
         if v_size + f_size < 4096:
@@ -194,19 +171,57 @@ def slim_frame_data(frames, frame_allowance=25):
 
     Returns ``frames``.
     """
-    frames_len = len(frames)
+    frames_len = 0
+    app_frames = []
+    system_frames = []
+    for frame in frames:
+        frames_len += 1
+        if frame.get('in_app'):
+            app_frames.append(frame)
+        else:
+            system_frames.append(frame)
 
     if frames_len <= frame_allowance:
         return frames
 
-    half_max = int(frame_allowance / 2)
+    remaining = frames_len - frame_allowance
+    app_count = len(app_frames)
+    system_allowance = max(frame_allowance - app_count, 0)
+    if system_allowance:
+        half_max = int(system_allowance / 2)
+        # prioritize trimming system frames
+        for frame in system_frames[half_max:-half_max]:
+            frame.pop('vars', None)
+            frame.pop('pre_context', None)
+            frame.pop('post_context', None)
+            remaining -= 1
 
-    for n in range(half_max, frames_len - half_max):
-        # remove heavy components
-        frames[n].pop('vars', None)
-        frames[n].pop('pre_context', None)
-        frames[n].pop('post_context', None)
+    else:
+        for frame in system_frames:
+            frame.pop('vars', None)
+            frame.pop('pre_context', None)
+            frame.pop('post_context', None)
+            remaining -= 1
+
+    if not remaining:
+        return frames
+
+    app_allowance = app_count - remaining
+    half_max = int(app_allowance / 2)
+
+    for frame in app_frames[half_max:-half_max]:
+        frame.pop('vars', None)
+        frame.pop('pre_context', None)
+        frame.pop('post_context', None)
     return frames
+
+
+def slim_string(value, length=512):
+    if not value:
+        return value
+    if len(value) > length:
+        return value[:length - 3] + '...'
+    return value[:length]
 
 
 def get_stack_info(frames, transformer=transform, capture_locals=True,
@@ -253,7 +268,8 @@ def get_stack_info(frames, transformer=transform, capture_locals=True,
             lineno -= 1
 
         if lineno is not None and abs_path:
-            pre_context, context_line, post_context = get_lines_from_file(abs_path, lineno, 5, loader, module_name)
+            pre_context, context_line, post_context = \
+                get_lines_from_file(abs_path, lineno, 5, loader, module_name)
         else:
             pre_context, context_line, post_context = None, None, None
 
@@ -261,7 +277,8 @@ def get_stack_info(frames, transformer=transform, capture_locals=True,
         # This changes /foo/site-packages/baz/bar.py into baz/bar.py
         try:
             base_filename = sys.modules[module_name.split('.', 1)[0]].__file__
-            filename = abs_path.split(base_filename.rsplit('/', 2)[0], 1)[-1].lstrip("/")
+            filename = abs_path.split(
+                base_filename.rsplit('/', 2)[0], 1)[-1].lstrip("/")
         except:
             filename = abs_path
 

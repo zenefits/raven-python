@@ -15,8 +15,6 @@ except ImportError:
 else:
     has_flask_login = True
 
-import sys
-import os
 import logging
 
 from flask import request, current_app, g
@@ -27,36 +25,32 @@ from raven.conf import setup_logging
 from raven.base import Client
 from raven.middleware import Sentry as SentryMiddleware
 from raven.handlers.logging import SentryHandler
-from raven.utils import six
 from raven.utils.compat import _urlparse
 from raven.utils.encoding import to_unicode
-from raven.utils.imports import import_string
 from raven.utils.wsgi import get_headers, get_environ
+from raven.utils.conf import convert_options
 
 
 def make_client(client_cls, app, dsn=None):
-    # TODO(dcramer): django and Flask share very similar concepts here, and
-    # should be refactored
-    transport = app.config.get('SENTRY_TRANSPORT')
-    if isinstance(transport, six.string_types):
-        transport = import_string(transport)
-
     return client_cls(
-        dsn=dsn or app.config.get('SENTRY_DSN') or os.environ.get('SENTRY_DSN'),
-        transport=transport,
-        include_paths=set(app.config.get('SENTRY_INCLUDE_PATHS', [])) | set([app.import_name]),
-        exclude_paths=app.config.get('SENTRY_EXCLUDE_PATHS'),
-        name=app.config.get('SENTRY_NAME'),
-        site=app.config.get('SENTRY_SITE_NAME'),
-        processors=app.config.get('SENTRY_PROCESSORS'),
-        string_max_length=app.config.get('SENTRY_MAX_LENGTH_STRING'),
-        list_max_length=app.config.get('SENTRY_MAX_LENGTH_LIST'),
-        auto_log_stacks=app.config.get('SENTRY_AUTO_LOG_STACKS'),
-        tags=app.config.get('SENTRY_TAGS'),
-        release=app.config.get('SENTRY_RELEASE'),
-        extra={
-            'app': app,
-        },
+        **convert_options(
+            app.config,
+            defaults={
+                'dsn': dsn,
+                'include_paths': (
+                    set(app.config.get('SENTRY_INCLUDE_PATHS', []))
+                    | set([app.import_name])
+                ),
+                # support legacy RAVEN_IGNORE_EXCEPTIONS
+                'ignore_exceptions': [
+                    '{0}.{1}'.format(x.__module__, x.__name__)
+                    for x in app.config.get('RAVEN_IGNORE_EXCEPTIONS', [])
+                ],
+                'extra': {
+                    'app': app,
+                },
+            },
+        )
     )
 
 
@@ -102,10 +96,14 @@ class Sentry(object):
     # TODO(dcramer): the client isn't using local context and therefore
     # gets shared by every app that does init on it
     def __init__(self, app=None, client=None, client_cls=Client, dsn=None,
-                 logging=False, level=logging.NOTSET, wrap_wsgi=None,
-                 register_signal=True):
+                 logging=False, logging_exclusions=None, level=logging.NOTSET,
+                 wrap_wsgi=None, register_signal=True):
+        if client and not isinstance(client, Client):
+            raise TypeError('client should be an instance of Client')
+
         self.dsn = dsn
         self.logging = logging
+        self.logging_exclusions = logging_exclusions
         self.client_cls = client_cls
         self.client = client
         self.level = level
@@ -117,6 +115,10 @@ class Sentry(object):
 
     @property
     def last_event_id(self):
+        try:
+            return g.sentry_event_id
+        except Exception:
+            pass
         return getattr(self, '_last_event_id', None)
 
     @last_event_id.setter
@@ -131,17 +133,12 @@ class Sentry(object):
         if not self.client:
             return
 
-        ignored_exc_type_list = current_app.config.get('RAVEN_IGNORE_EXCEPTIONS', [])
-        exc = sys.exc_info()[1]
-
-        if any((isinstance(exc, ignored_exc_type) for ignored_exc_type in ignored_exc_type_list)):
-            return
-
         self.captureException(exc_info=kwargs.get('exc_info'))
 
     def get_user_info(self, request):
         """
-        Requires Flask-Login (https://pypi.python.org/pypi/Flask-Login/) to be installed
+        Requires Flask-Login (https://pypi.python.org/pypi/Flask-Login/)
+        to be installed
         and setup
         """
         if not has_flask_login:
@@ -219,6 +216,10 @@ class Sentry(object):
 
     def before_request(self, *args, **kwargs):
         self.last_event_id = None
+
+        if request.url_rule:
+            self.client.transaction.push(request.url_rule.rule)
+
         try:
             self.client.http_context(self.get_http_info(request))
         except Exception as e:
@@ -232,9 +233,12 @@ class Sentry(object):
         if self.last_event_id:
             response.headers['X-Sentry-ID'] = self.last_event_id
         self.client.context.clear()
+        if request.url_rule:
+            self.client.transaction.pop(request.url_rule.rule)
         return response
 
-    def init_app(self, app, dsn=None, logging=None, level=None, wrap_wsgi=None,
+    def init_app(self, app, dsn=None, logging=None, level=None,
+                 logging_exclusions=None, wrap_wsgi=None,
                  register_signal=None):
         if dsn is not None:
             self.dsn = dsn
@@ -258,11 +262,18 @@ class Sentry(object):
         if logging is not None:
             self.logging = logging
 
+        if logging_exclusions is not None:
+            self.logging_exclusions = logging_exclusions
+
         if not self.client:
             self.client = make_client(self.client_cls, app, self.dsn)
 
         if self.logging:
-            setup_logging(SentryHandler(self.client, level=self.level))
+            kwargs = {}
+            if self.logging_exclusions is not None:
+                kwargs['exclude'] = self.logging_exclusions
+
+            setup_logging(SentryHandler(self.client, level=self.level), **kwargs)
 
         if self.wrap_wsgi:
             app.wsgi_app = SentryMiddleware(app.wsgi_app, self.client)

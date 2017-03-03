@@ -12,7 +12,7 @@ from django.conf import settings
 from django.http import HttpRequest
 from django.utils.functional import Promise
 from raven.utils.serializer import Serializer, register
-from raven.utils import six
+from raven._compat import text_type
 
 __all__ = ('PromiseSerializer',)
 
@@ -34,13 +34,17 @@ class PromiseSerializer(Serializer):
 
     def serialize(self, value, **kwargs):
         # EPIC HACK
-        # handles lazy model instances (which are proxy values that don't easily give you the actual function)
+        # handles lazy model instances (which are proxy values that don't
+        # easily give you the actual function)
         pre = value.__class__.__name__[1:]
         if hasattr(value, '%s__func' % pre):
-            value = getattr(value, '%s__func' % pre)(*getattr(value, '%s__args' % pre), **getattr(value, '%s__kw' % pre))
+            value = getattr(value, '%s__func' % pre)(
+                *getattr(value, '%s__args' % pre),
+                **getattr(value, '%s__kw' % pre))
         else:
-            return self.recurse(six.text_type(value))
+            return self.recurse(text_type(value))
         return self.recurse(value, **kwargs)
+
 
 register(PromiseSerializer)
 
@@ -51,19 +55,19 @@ class HttpRequestSerializer(Serializer):
     def serialize(self, value, **kwargs):
         return '<%s at 0x%s>' % (type(value).__name__, id(value))
 
+
 register(HttpRequestSerializer)
 
+#Always register
+from django.db.models.query import QuerySet
 
-if getattr(settings, 'DATABASES', None):
-    from django.db.models.query import QuerySet
+class QuerySetSerializer(Serializer):
+    types = (QuerySet,)
 
-    class QuerySetSerializer(Serializer):
-        types = (QuerySet,)
+    def serialize(self, value, **kwargs):
+        qs_name = type(value).__name__
+        if value.model:
+            return '<%s: model=%s>' % (qs_name, value.model.__name__)
+        return '<%s: (Unbound)>' % (qs_name,)
 
-        def serialize(self, value, **kwargs):
-            qs_name = type(value).__name__
-            if value.model:
-                return '<%s: model=%s>' % (qs_name, value.model.__name__)
-            return '<%s: (Unbound)>' % (qs_name,)
-
-    register(QuerySetSerializer)
+register(QuerySetSerializer)

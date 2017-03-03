@@ -14,10 +14,10 @@ import logging
 import sys
 import traceback
 
+from raven._compat import string_types, iteritems, text_type
 from raven.base import Client
-from raven.utils import six
 from raven.utils.encoding import to_string
-from raven.utils.stacks import iter_stack_frames, label_from_frame
+from raven.utils.stacks import iter_stack_frames
 
 RESERVED = frozenset((
     'stack', 'name', 'module', 'funcName', 'args', 'msg', 'levelno',
@@ -26,20 +26,42 @@ RESERVED = frozenset((
 ))
 
 
+def extract_extra(record, reserved=RESERVED):
+    data = {}
+
+    extra = getattr(record, 'data', None)
+    if not isinstance(extra, dict):
+        if extra:
+            extra = {'data': extra}
+        else:
+            extra = {}
+
+    for k, v in iteritems(vars(record)):
+        if k in reserved:
+            continue
+        if k.startswith('_'):
+            continue
+        if '.' not in k and k not in ('culprit', 'server_name', 'fingerprint'):
+            extra[k] = v
+        else:
+            data[k] = v
+
+    return data, extra
+
+
 class SentryHandler(logging.Handler, object):
     def __init__(self, *args, **kwargs):
         client = kwargs.get('client_cls', Client)
         if len(args) == 1:
             arg = args[0]
-            if isinstance(arg, six.string_types):
+            if isinstance(arg, string_types):
                 self.client = client(dsn=arg, **kwargs)
             elif isinstance(arg, Client):
                 self.client = arg
             else:
-                raise ValueError('The first argument to %s must be either a Client instance or a DSN, got %r instead.' % (
-                    self.__class__.__name__,
-                    arg,
-                ))
+                raise ValueError('The first argument to %s must be either a '
+                                 'Client instance or a DSN, got %r instead.' %
+                                 (self.__class__.__name__, arg,))
         elif 'client' in kwargs:
             self.client = kwargs['client']
         else:
@@ -55,7 +77,7 @@ class SentryHandler(logging.Handler, object):
             record.name.startswith(('sentry.errors', 'raven.'))
         )
 
-    def emit(self, record):
+    def emit(self, record, **kwargs):
         try:
             # Beware to python3 bug (see #10805) if exc_info is (None, None, None)
             self.format(record)
@@ -64,11 +86,12 @@ class SentryHandler(logging.Handler, object):
                 print(to_string(record.message), file=sys.stderr)
                 return
 
-            return self._emit(record)
+            return self._emit(record, **kwargs)
         except Exception:
             if self.client.raise_send_errors:
                 raise
-            print("Top level Sentry exception caught - failed creating log record", file=sys.stderr)
+            print("Top level Sentry exception caught - failed "
+                  "creating log record", file=sys.stderr)
             print(to_string(record.msg), file=sys.stderr)
             print(to_string(traceback.format_exc()), file=sys.stderr)
 
@@ -104,24 +127,7 @@ class SentryHandler(logging.Handler, object):
         return frames
 
     def _emit(self, record, **kwargs):
-        data = {}
-
-        extra = getattr(record, 'data', None)
-        if not isinstance(extra, dict):
-            if extra:
-                extra = {'data': extra}
-            else:
-                extra = {}
-
-        for k, v in six.iteritems(vars(record)):
-            if k in RESERVED:
-                continue
-            if k.startswith('_'):
-                continue
-            if '.' not in k and k not in ('culprit', 'server_name', 'fingerprint'):
-                extra[k] = v
-            else:
-                data[k] = v
+        data, extra = extract_extra(record)
 
         stack = getattr(record, 'stack', None)
         if stack is True:
@@ -136,13 +142,13 @@ class SentryHandler(logging.Handler, object):
             'params': record.args,
         }
         try:
-            handler_kwargs['message'] = six.text_type(record.msg)
+            handler_kwargs['message'] = text_type(record.msg)
         except UnicodeDecodeError:
             # Handle binary strings where it should be unicode...
             handler_kwargs['message'] = repr(record.msg)[1:-1]
 
         try:
-            handler_kwargs['formatted'] = six.text_type(record.message)
+            handler_kwargs['formatted'] = text_type(record.message)
         except UnicodeDecodeError:
             # Handle binary strings where it should be unicode...
             handler_kwargs['formatted'] = repr(record.message)[1:-1]
@@ -158,12 +164,6 @@ class SentryHandler(logging.Handler, object):
 
             event_type = 'raven.events.Exception'
             handler_kwargs = {'exc_info': record.exc_info}
-
-        # HACK: discover a culprit when we normally couldn't
-        elif not (data.get('stacktrace') or data.get('culprit')) and (record.name or record.funcName):
-            culprit = label_from_frame({'module': record.name, 'function': record.funcName})
-            if culprit:
-                data['culprit'] = culprit
 
         data['level'] = record.levelno
         data['logger'] = record.name

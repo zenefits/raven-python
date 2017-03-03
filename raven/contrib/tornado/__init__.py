@@ -11,6 +11,7 @@ from functools import partial
 
 from tornado import ioloop
 from tornado.httpclient import AsyncHTTPClient, HTTPError
+from tornado.web import HTTPError as WebHTTPError
 
 from raven.base import Client
 
@@ -37,9 +38,9 @@ class AsyncSentryClient(Client):
 
         data = self.build_msg(*args, **kwargs)
 
-        self.send(callback=kwargs.get('callback', None), **data)
+        future = self.send(callback=kwargs.get('callback', None), **data)
 
-        return (data['event_id'],)
+        return (data['event_id'], future)
 
     def send(self, auth_header=None, callback=None, **data):
         """
@@ -227,6 +228,9 @@ class SentryMixin(object):
         log_exception() is added in Tornado v3.1.
         """
         rv = super(SentryMixin, self).log_exception(typ, value, tb)
+        # Do not capture tornado.web.HTTPErrors outside the 500 range.
+        if isinstance(value, WebHTTPError) and (value.status_code < 500 or value.status_code > 599):
+            return rv
         self.captureException(exc_info=(typ, value, tb))
         return rv
 
